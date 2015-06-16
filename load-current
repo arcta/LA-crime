@@ -1,0 +1,32 @@
+#!/bin/bash
+
+. ~/.local.cnf
+
+DATE=$(date +'%Y%m%d')
+DIR=$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)
+COLLECTION=$'crime_recent'
+
+########################################################################
+### recent 30 days window daily download ( cron job )
+
+if [ -f $DIR/archive/$DATE.csv.gz ]; then
+    echo "Local archive exists"
+    gzip -d $DIR/archive/$DATE.csv.gz
+    mv $DIR/archive/$DATE.csv $DIR/data/$DATE.csv
+else
+    curl -o $DIR/data/$DATE.csv \
+        http://shq.lasdnews.net/CrimeStats/CAASS/PART_I_AND_II_CRIMES.csv
+    cp $DIR/data/$DATE.csv $DIR/archive/$DATE.csv
+    gzip $DIR/archive/$DATE.csv
+fi
+
+tr '[:upper:]' '[:lower:]' < $DIR/data/$DATE.csv > $DIR/data/CURRENT.csv
+perl -pi -e 's/[[:^ascii:]]//g' $DIR/data/CURRENT.csv
+sed -i '1!b;s/"//g' $DIR/data/CURRENT.csv
+rm $DIR/data/$DATE.csv
+
+########################################################################
+### validate, filter & transform data into format used by app
+
+python $DIR/current-syncup.py
+

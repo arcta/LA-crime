@@ -1,0 +1,169 @@
+#!/bin/bash
+
+. ~/.local.cnf
+
+START_YEAR=2005
+CURRENT_YEAR=$(date +'%Y')
+DIR=$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)
+COLLECTION=$'crime'
+
+########################################################################
+###  Load archived files from http://shq.lasdnews.net/CrimeStats/CAASS/
+
+if [ -d $DIR/archive ]; then
+    echo "Local archive exists"
+else
+    mkdir $DIR/archive
+fi
+
+if ! [ -d $DIR/data ]; then
+    mkdir $DIR/data
+fi
+
+let Y=$START_YEAR
+while [[ $Y -lt $CURRENT_YEAR ]]
+do
+    if [ -f $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv.gz ]; then
+        echo "$Y using local archive..."
+        gzip -d $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv.gz
+    else
+        curl -o $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv \
+                http://shq.lasdnews.net/CrimeStats/CAASS/$Y-PART_I_AND_II_CRIMES.csv
+    fi
+
+    tr '[:upper:]' '[:lower:]' < $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv > $DIR/data/$Y.csv
+    perl -pi -e 's/[[:^ascii:]]//g' $DIR/data/$Y.csv
+    sed -i '1!b;s/"//g' $DIR/data/$Y.csv
+    gzip $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv
+    ((Y = Y + 1))
+done
+
+########################################################################
+### free source for non-profit #########################################
+
+if ! [ -f $DIR/archive/usps_zcta5.csv.gz ]; then
+    curl -o $DIR/archive/usps_zcta5.csv \
+            http://www.unitedstateszipcodes.org/zip_code_database.csv
+    echo "
+    /***********************************************************************
+        free source for non-profit:
+        http://www.unitedstateszipcodes.org/zip-code-database/
+    ***********************************************************************/
+    drop table if exists usps_zcta5;
+    create table usps_zcta5(
+        zip char(5) not null default '00000',
+        type varchar(20),
+        primary_city varchar(150),
+        acceptable_cities text,
+        unacceptable_cities text,
+        state char(2),
+        county varchar(150),
+        timezone varchar(150),
+        area_codes int,
+        latitude float,
+        longitude float,
+        world_region varchar(10),
+        country varchar(10),
+        decommissioned bool,
+        estimated_population int,
+        notes varchar(255),
+        primary key (zip)
+    );
+
+    load data local infile '${DIR}/archive/usps_zcta5.csv'
+    into table usps_zcta5 fields terminated by ',' enclosed by '\"'
+    ignore 1 lines;
+    " > usps-zcta5-import.sql
+
+    mysql --user=root --password=$NODE_MYSQL_ROOT_PASS $NODE_DATABASE \
+            < usps-zcta5-import.sql
+fi
+
+########################################################################
+### clean, validate, filter & transform data into format used by app ###
+
+python $DIR/archive-audit.py
+#python $DIR/archive-import.py
+
+########################################################################
+### load to databases ##################################################
+echo "
+db = db.getSiblingDB('$NODE_DATABASE');
+db.createUser({ user: '$NODE_DATAUSER', pwd: '$NODE_MONGO_PASS', roles: [ { role: 'readWrite', db: '$NODE_DATABASE' } ] });
+" > mongo.js
+mongo admin -u root -p $NODE_MONGO_ROOT_PASS mongo.js
+rm mongo.js
+
+((LAST_YEAR = CURRENT_YEAR -1))
+### drop collection if exists and load most recent year
+mongoimport --username $NODE_DATAUSER --password $NODE_MONGO_PASS \
+            --collection $COLLECTION --db $NODE_DATABASE --drop \
+            --file $DIR/data/$LAST_YEAR.json
+echo "$LAST_YEAR imported"
+### load other years
+while [[ $LAST_YEAR -gt $START_YEAR ]]
+do
+    ((LAST_YEAR = LAST_YEAR - 1))
+    mongoimport --username $NODE_DATAUSER --password $NODE_MONGO_PASS \
+                --collection $COLLECTION --db $NODE_DATABASE \
+                --file $DIR/data/$LAST_YEAR.json
+    echo "$LAST_YEAR imported"
+done
+
+echo "
+db.$COLLECTION.find().forEach(function(doc) {
+    doc.date = new Date(doc.date);
+    db.$COLLECTION.save(doc);
+});
+
+db.zip_info.find({ state: 'CA'}).forEach(function(doc) {
+    zip = doc._id;
+    var paths;
+    try {
+        paths = JSON.parse(doc.geo_opt);
+    } catch (e) {
+
+    } finally {
+        if (paths && paths.length) {
+            for (var j=0; j < paths.length; j++) {
+                db.$COLLECTION.find({ loc: { \$geoWithin: { \$polygon: paths[j] }}}).forEach(function(rec) {
+                    db.$COLLECTION.update({ _id: rec._id },{ \$set: { zip: parseInt(zip,10) }});
+                });
+            }
+        }
+    }
+});
+
+db.zip_info.find({ state: 'CA'}).forEach(function(doc) {
+    zip = doc._id;
+    loc = doc.loc
+    var paths;
+    try {
+        paths = JSON.parse(doc.geo_opt);
+    } catch (e) {
+
+    } finally {
+        if (paths && paths.length) {
+            for (var j=0; j < paths.length; j++) {
+                db.$COLLECTION.find({ loc: null, zip: zip }).forEach(function(rec) {
+                    db.$COLLECTION.update({ _id: rec._id },{ \$set: { loc: loc }});
+                });
+            }
+        }
+    }
+});
+
+db.$COLLECTION.find({ zip: { \$ne: '' }, loc: null }).forEach(function(doc) {
+    db.zip_info.find({ _id: doc.zip }).forEach(function(zip) {
+        db.$COLLECTION.update({ _id: doc._id },{ \$set: { loc: zip.loc }});
+    });
+});
+
+db.$COLLECTION.ensureIndex({ 'year': 1 });
+db.$COLLECTION.ensureIndex({ 'city': 1 });
+db.$COLLECTION.ensureIndex({ 'category': 1 });
+
+db.$COLLECTION.ensureIndex({ 'year': 1, 'category': 1 });
+db.$COLLECTION.ensureIndex({ 'city': 1, 'category': 1 });
+" > collection.js
+#mongo $NODE_DATABASE -u $NODE_DATAUSER -p $NODE_MONGO_PASS collection.js
