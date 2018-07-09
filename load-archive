@@ -21,8 +21,7 @@ if ! [ -d $DIR/data ]; then
 fi
 
 let Y=$START_YEAR
-while [[ $Y -lt $CURRENT_YEAR ]]
-do
+while [[ $Y -lt $CURRENT_YEAR ]]; do
     if [ -f $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv.gz ]; then
         echo "$Y using local archive..."
         gzip -d $DIR/archive/$Y-PART_I_AND_II_CRIMES.csv.gz
@@ -75,7 +74,7 @@ if ! [ -f $DIR/archive/usps_zcta5.csv.gz ]; then
     ignore 1 lines;
     " > usps-zcta5-import.sql
 
-    mysql --user=root --password=$NODE_MYSQL_ROOT_PASS $NODE_DATABASE \
+    mysql --user=root --password=$MYSQL_ROOT_PASS $DATABASE \
             < usps-zcta5-import.sql
 fi
 
@@ -83,87 +82,30 @@ fi
 ### clean, validate, filter & transform data into format used by app ###
 
 python $DIR/archive-audit.py
-#python $DIR/archive-import.py
+# convert to jsonArray: new-line-separated records
+for file in `find data -name "F20*.json"`; do
+    sed -i 's/},{/}\n{/g' $file
+    sed -i 's/\[{/{/g' $file
+    sed -i 's/}\]/}\n/g' $file
+done
+
+python $DIR/archive-import.py
 
 ########################################################################
-### load to databases ##################################################
-echo "
-db = db.getSiblingDB('$NODE_DATABASE');
-db.createUser({ user: '$NODE_DATAUSER', pwd: '$NODE_MONGO_PASS', roles: [ { role: 'readWrite', db: '$NODE_DATABASE' } ] });
-" > mongo.js
-mongo admin -u root -p $NODE_MONGO_ROOT_PASS mongo.js
-rm mongo.js
+### load to other databases ############################################
 
 ((LAST_YEAR = CURRENT_YEAR -1))
 ### drop collection if exists and load most recent year
-mongoimport --username $NODE_DATAUSER --password $NODE_MONGO_PASS \
-            --collection $COLLECTION --db $NODE_DATABASE --drop \
-            --file $DIR/data/$LAST_YEAR.json
+mongoimport --username $DATAUSER --password $MONGO_PASS \
+            --collection $COLLECTION --db $DATABASE --drop \
+            --file $DIR/data/$LAST_YEAR.json --jsonArray --batchSize 1
 echo "$LAST_YEAR imported"
 ### load other years
 while [[ $LAST_YEAR -gt $START_YEAR ]]
 do
     ((LAST_YEAR = LAST_YEAR - 1))
-    mongoimport --username $NODE_DATAUSER --password $NODE_MONGO_PASS \
-                --collection $COLLECTION --db $NODE_DATABASE \
-                --file $DIR/data/$LAST_YEAR.json
+    mongoimport --username $DATAUSER --password $MONGO_PASS \
+                --collection $COLLECTION --db $DATABASE \
+                --file $DIR/data/$LAST_YEAR.json --jsonArray --batchSize 1
     echo "$LAST_YEAR imported"
 done
-
-echo "
-db.$COLLECTION.find().forEach(function(doc) {
-    doc.date = new Date(doc.date);
-    db.$COLLECTION.save(doc);
-});
-
-db.zip_info.find({ state: 'CA'}).forEach(function(doc) {
-    zip = doc._id;
-    var paths;
-    try {
-        paths = JSON.parse(doc.geo_opt);
-    } catch (e) {
-
-    } finally {
-        if (paths && paths.length) {
-            for (var j=0; j < paths.length; j++) {
-                db.$COLLECTION.find({ loc: { \$geoWithin: { \$polygon: paths[j] }}}).forEach(function(rec) {
-                    db.$COLLECTION.update({ _id: rec._id },{ \$set: { zip: parseInt(zip,10) }});
-                });
-            }
-        }
-    }
-});
-
-db.zip_info.find({ state: 'CA'}).forEach(function(doc) {
-    zip = doc._id;
-    loc = doc.loc
-    var paths;
-    try {
-        paths = JSON.parse(doc.geo_opt);
-    } catch (e) {
-
-    } finally {
-        if (paths && paths.length) {
-            for (var j=0; j < paths.length; j++) {
-                db.$COLLECTION.find({ loc: null, zip: zip }).forEach(function(rec) {
-                    db.$COLLECTION.update({ _id: rec._id },{ \$set: { loc: loc }});
-                });
-            }
-        }
-    }
-});
-
-db.$COLLECTION.find({ zip: { \$ne: '' }, loc: null }).forEach(function(doc) {
-    db.zip_info.find({ _id: doc.zip }).forEach(function(zip) {
-        db.$COLLECTION.update({ _id: doc._id },{ \$set: { loc: zip.loc }});
-    });
-});
-
-db.$COLLECTION.ensureIndex({ 'year': 1 });
-db.$COLLECTION.ensureIndex({ 'city': 1 });
-db.$COLLECTION.ensureIndex({ 'category': 1 });
-
-db.$COLLECTION.ensureIndex({ 'year': 1, 'category': 1 });
-db.$COLLECTION.ensureIndex({ 'city': 1, 'category': 1 });
-" > collection.js
-#mongo $NODE_DATABASE -u $NODE_DATAUSER -p $NODE_MONGO_PASS collection.js
